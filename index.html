@@ -447,49 +447,91 @@ async function directFetch(url){
 let geoBusy = false;
 function geoCacheGet(q){ try{ return JSON.parse(localStorage.getItem('geo:'+q)||'null'); }catch(e){ return null; } }
 function geoCacheSet(q,v){ try{ localStorage.setItem('geo:'+q, JSON.stringify(v)); }catch(e){} }
-async function searchText(q){
-  if (geoBusy) return;                       // 查詢中忽略重複點擊
-  const hit = geoCacheGet(q);                // 同一地址已查過就直接用快取，不再發請求
-  if (hit) { pushHistory(q, hit.lat, hit.lng); return run(hit.lat, hit.lng, hit.label + '（快取）'); }
-  geoBusy = true;
-  setModern('查詢地址中…');
-  try {
-    // 1) Photon：支援中文地址與地標，只送一次
-    try {
-      const pj = await (await directFetch(PHOTON + encodeURIComponent(q.replace(/\s+/g,'')))).json();
-      const f = (pj.features || [])[0];
-      if (f) {
-        const L2 = acLabel(f), lat = f.geometry.coordinates[1], lng = f.geometry.coordinates[0];
-        const label = [L2.sub, L2.title].filter(Boolean).join(' ');
-        geoCacheSet(q, {lat, lng, label}); pushHistory(q, lat, lng); return run(lat, lng, label);
-      }
-    } catch (e) { console.warn('[Photon 失敗]', e.message); }
-
-    // 2) Nominatim 備援：最多 3 次，間隔 1.5 秒；遇到 429 立即停止
-    const tries = addressTries(q).slice(0, 3);
-    for (let i = 0; i < tries.length; i++) {
-      if (i) await new Promise(r => setTimeout(r, 1500));
-      const url = 'https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=tw&accept-language=zh-TW&q=' + encodeURIComponent(tries[i].text);
-      let r;
-      try { r = await directFetch(url); }
-      catch (e) {
-        if (/429/.test(e.message)) {
-          setModern('地理編碼服務目前限流，請約 1 分鐘後再試，或直接輸入座標（例如 24.82, 121.08）。', true);
-          return;
-        }
-        continue;
-      }
-      const data = await r.json();
-      if (data.length) {
-        const lat = parseFloat(data[0].lat), lng = parseFloat(data[0].lon);
-        const note = tries[i].level ? '（只定位到' + tries[i].level + '，非精確門牌）' : '';
-        const label = data[0].display_name + note;
-        geoCacheSet(q, {lat, lng, label}); pushHistory(q, lat, lng); return run(lat, lng, label);
+// 解析 Google 地圖網址中的座標（純字串處理，不送任何請求）
+// 支援：.../maps/place/...!3d緯度!4d經度  、  .../maps/...@緯度,經度,縮放  、  ?q=緯度,經度
+function parseGoogleMapsUrl(text){
+  const pats = [/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/, /@(-?\d+\.\d+),(-?\d+\.\d+)/, /[?&]q=(-?\d+\.\d+),(-?\d+\.\d+)/];
+  for (const re of pats){
+    const m = text.match(re);
+    if (m){
+      const lat = parseFloat(m[1]), lng = parseFloat(m[2]);
+      if (lat >= 21 && lat <= 26 && lng >= 119 && lng <= 123) return {lat, lng};
+    }
+  }
+  return null;
+}
+const GMAPS_RE = /(google\.[a-z.]+\/maps|maps\.google\.[a-z.]+|maps\.app\.goo\.gl|goo\.gl\/maps)/i;
+function cleanQuery(q){ return String(q||'').replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim(); }
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function getJSON(url, ms=8000){
+  const r = await fetch(url, {signal: AbortSignal.timeout(ms)});
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
+// Photon：支援地點名稱（店家、地標）＋ 地址；保留空白讓多詞名稱能正確比對
+async function photonSearch(q){
+  const variants = [...new Set([q, q.replace(/\s+/g, '')])].slice(0, 2);
+  for (const v of variants){
+    for (let attempt = 0; attempt < 2; attempt++){
+      try{
+        const pj = await getJSON(PHOTON + encodeURIComponent(v));
+        const f = (pj.features || [])[0];
+        if (f) return f;
+        break;                               // 這個寫法沒結果，換下一個寫法
+      }catch(e){
+        if (attempt === 0) await sleep(800);  // 連線被重置多半是暫時的，重試一次
+        else console.warn('[Photon]', e.message);
       }
     }
-    setModern('找不到這個地址。請改用地標名稱、輸入座標，或直接在地圖上點選位置。', true);
+  }
+  return null;
+}
+// Nominatim 備援：最多 3 次；瀏覽器無法區分 CORS／429／網路錯誤，失敗一次就停止
+async function nominatimSearch(q){
+  const tries = [{text:q, level:''}, ...addressTries(q).slice(1)].slice(0, 3);
+  for (let i = 0; i < tries.length; i++){
+    if (i) await sleep(1500);
+    const url = 'https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=tw&accept-language=zh-TW&q=' + encodeURIComponent(tries[i].text);
+    let data;
+    try { data = await getJSON(url); }
+    catch (e) { return {blocked: true}; }
+    if (data.length) return {f: {lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon), name: data[0].display_name}, level: tries[i].level};
+  }
+  return null;
+}
+async function searchText(q){
+  q = cleanQuery(q);
+  if (!q) return;
+  if (geoBusy) return;                       // 查詢中忽略重複點擊
+  if (GMAPS_RE.test(q)) {                    // 貼上 Google 地圖網址：直接解析座標
+    const p = parseGoogleMapsUrl(q);
+    if (p) { pushHistory(q, p.lat, p.lng); return run(p.lat, p.lng, 'Google 地圖位置'); }
+    setModern('無法從這個連結取得座標。請複製瀏覽器網址列的完整網址（不要用 goo.gl 短網址）。', true);
+    return;
+  }
+  const hit = geoCacheGet(q);                // 同一查詢已查過，直接用快取
+  if (hit) { pushHistory(q, hit.lat, hit.lng); return run(hit.lat, hit.lng, hit.label + '（快取）'); }
+
+  geoBusy = true;
+  setModern('查詢中…');
+  try {
+    const pf = await photonSearch(q);
+    if (pf) {
+      const L2 = acLabel(pf), lat = pf.geometry.coordinates[1], lng = pf.geometry.coordinates[0];
+      const label = [L2.sub, L2.title].filter(Boolean).join(' ');
+      geoCacheSet(q, {lat, lng, label}); pushHistory(q, lat, lng); return run(lat, lng, label);
+    }
+    const nr = await nominatimSearch(q);
+    if (nr && nr.f) {
+      const note = nr.level ? '（只定位到' + nr.level + '，非精確門牌）' : '';
+      const label = nr.f.name + note;
+      geoCacheSet(q, {lat: nr.f.lat, lng: nr.f.lng, label}); pushHistory(q, nr.f.lat, nr.f.lng);
+      return run(nr.f.lat, nr.f.lng, label);
+    }
+    if (nr && nr.blocked) setModern('地點服務暫時無法連線或被限流。請稍後 1 分鐘再試，或改貼 Google 地圖的完整網址。', true);
+    else setModern('找不到「' + q + '」。可加上縣市、路名或地標，例如「新竹縣 新埔鎮 穀倉咖啡」。', true);
   } catch (e) {
-    setModern('地址查詢失敗。請檢查網路連線，或改輸入座標。', true);
+    setModern('查詢失敗，請檢查網路連線後再試。', true);
   } finally {
     geoBusy = false;
   }
