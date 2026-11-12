@@ -442,15 +442,19 @@ async function searchText(q){
   try {
     // 先試 Photon（對地標、路名比較寬容），找不到再用 Nominatim 逐步放寬
     try {
-      const pj = await (await fetch(PHOTON + encodeURIComponent(q.replace(/\s+/g, '')))).json();
+      const photonUrl = PHOTON + encodeURIComponent(q.replace(/\s+/g, ''));
+      const pjRaw = await (await fetch('https://api.allorigins.win/get?url='+encodeURIComponent(photonUrl))).json();
+      const pj = typeof pjRaw.contents==='string' ? JSON.parse(pjRaw.contents) : pjRaw;
       const f = (pj.features || [])[0];
       if (f) { const L2 = acLabel(f); pushHistory(q, f.geometry.coordinates[1], f.geometry.coordinates[0]); return run(f.geometry.coordinates[1], f.geometry.coordinates[0], [L2.sub, L2.title].filter(Boolean).join(' ')); }
     } catch (e) {}
     const tries = addressTries(q);
     for (let i = 0; i < tries.length; i++) {
       if (i) await new Promise(r => setTimeout(r, 1100)); // Nominatim 限制每秒 1 次
-      const url = 'https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=tw&accept-language=zh-TW&q=' + encodeURIComponent(tries[i].text);
-      const r = await (await fetch(url)).json();
+      const nomUrl = 'https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=tw&accept-language=zh-TW&q=' + encodeURIComponent(tries[i].text);
+      const url = 'https://api.allorigins.win/get?url=' + encodeURIComponent(nomUrl);
+      const raw = await (await fetch(url)).json();
+      const r = typeof raw.contents === 'string' ? JSON.parse(raw.contents) : raw;
       if (r.length) {
         const note = tries[i].level ? '（只定位到' + tries[i].level + '，非精確門牌）' : '';
         pushHistory(q, parseFloat(r[0].lat), parseFloat(r[0].lon));
@@ -697,7 +701,7 @@ async function buildCanvas(id, lat, lng, R){
   // 較寬鬆的黑色判定（細柱在掃描圖上常常偏灰）
   const soft = new Uint8Array(W*H);
   for (let i = 0; i < W*H; i++) soft[i] = d[4*i+3] > 128 && (0.299*d[4*i] + 0.587*d[4*i+1] + 0.114*d[4*i+2]) < 140 ? 1 : 0;
-  return {id, z, x0, y0, W, H, mpp, mask, integ, integ2:mkInteg(soft)};
+  return {id, z, x0, y0, W, H, mpp, mask, integ, integ2:mkInteg(soft), rgba:d};
 }
 
 const SENS = {
@@ -1044,7 +1048,7 @@ $('importfile').addEventListener('change', async ev => {
 <script>
 
 function scanWithCNN(cv, sensitivity){
-  const {W,H,data}=cv;
+  const {W,H,rgba:data}=cv; if(!data) return [];
   const SZ=24, STEP=4;
   const THRESH=sensitivity==='strict'?0.82:sensitivity==='loose'?0.52:0.68;
   const cand=[];
