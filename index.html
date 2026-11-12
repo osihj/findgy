@@ -437,20 +437,12 @@ $('form').addEventListener('submit', ev => {
   if (m) return run(parseFloat(m[1]), parseFloat(m[2]), q);
   searchText(q);
 });
-// CORS proxy 清單，依序嘗試
-const PROXIES = [
-  url => 'https://corsproxy.io/?' + encodeURIComponent(url),
-  url => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url),
-  url => 'https://thingproxy.freeboard.io/fetch/' + url,
-];
-async function proxiedFetch(targetUrl){
-  for(const proxy of PROXIES){
-    try{
-      const r = await fetch(proxy(targetUrl), {signal: AbortSignal.timeout(6000)});
-      if(r.ok) return r;
-    } catch(e){}
-  }
-  throw new Error('所有 proxy 均失敗');
+// 直接呼叫地理編碼服務（Photon、Nominatim 皆支援瀏覽器直連）。
+// 不再使用第三方代理：代理不穩定，且會把地址送到不明伺服器。
+async function directFetch(url){
+  const r = await fetch(url, {signal: AbortSignal.timeout(8000)});
+  if(!r.ok) throw new Error('HTTP ' + r.status + ' @ ' + new URL(url).host);
+  return r;
 }
 async function searchText(q){
   setModern('查詢地址中…');
@@ -458,16 +450,16 @@ async function searchText(q){
     // 先試 Photon（對地標、路名比較寬容），找不到再用 Nominatim 逐步放寬
     try {
       const photonUrl = PHOTON + encodeURIComponent(q.replace(/\s+/g, ''));
-      const pj = await (await proxiedFetch(photonUrl)).json();
+      const pj = await (await directFetch(photonUrl)).json();
       const f = (pj.features || [])[0];
       if (f) { const L2 = acLabel(f); pushHistory(q, f.geometry.coordinates[1], f.geometry.coordinates[0]); return run(f.geometry.coordinates[1], f.geometry.coordinates[0], [L2.sub, L2.title].filter(Boolean).join(' ')); }
-    } catch (e) {}
+    } catch (e) { console.warn('[Photon 失敗，改用 Nominatim]', e.message); }
     const tries = addressTries(q);
     for (let i = 0; i < tries.length; i++) {
       if (i) await new Promise(r => setTimeout(r, 1100)); // Nominatim 限制每秒 1 次
       const nomUrl = 'https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=tw&accept-language=zh-TW&q=' + encodeURIComponent(tries[i].text);
       
-      const r = await (await proxiedFetch(nomUrl)).json();
+      const r = await (await directFetch(nomUrl)).json();
       if (r.length) {
         const note = tries[i].level ? '（只定位到' + tries[i].level + '，非精確門牌）' : '';
         pushHistory(q, parseFloat(r[0].lat), parseFloat(r[0].lon));
